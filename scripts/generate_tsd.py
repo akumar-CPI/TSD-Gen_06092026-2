@@ -263,6 +263,51 @@ def resolve_field(context, field_spec):
     return context.get(field_spec, "")
 
 
+# --- Helpers to find body text and external params ---------------------------------
+EXTERNAL_PARAM_KEYS = [
+    "externalParameters", "externalParameterTable", "externalParametersTable",
+    "externalParametersList", "adapterSpecificParameters", "externalParams",
+    "externalParameter"
+]
+BODY_FALLBACK_KEYS = [
+    "bodyContent", "body", "messageBody", "content", "MessageBody",
+    "bodyText", "soapBody", "payload"
+]
+
+
+def extract_text_from_xml(maybe_xml):
+    """If value contains XML, strip tags and return concatenated text nodes; else return original string."""
+    if not maybe_xml or "<" not in maybe_xml:
+        return maybe_xml or ""
+    wrapped = f"<root>{maybe_xml}</root>"
+    try:
+        root = ET.fromstring(wrapped)
+        return "".join(root.itertext()).strip()
+    except ET.ParseError:
+        # not well-formed XML - return original
+        return maybe_xml
+
+
+def find_body_in_context(context):
+    for key in BODY_FALLBACK_KEYS:
+        v = context.get(key)
+        if v:
+            txt = extract_text_from_xml(v)
+            logger.debug(f"Found body using key '{key}' (len={len(txt)})")
+            return txt
+    # as a last resort, check for single large property that may contain the body
+    for k, v in context.items():
+        if isinstance(v, str) and len(v) > 200 and "<row" not in v:
+            txt = extract_text_from_xml(v)
+            logger.debug(f"Heuristic: using key '{k}' as body (len={len(txt)})")
+            return txt
+    return ""
+
+
+# --------------------------------------------------------------------------
+# Main per-element renderer
+# --------------------------------------------------------------------------
+
 def render_schema_table(doc, schema, name, properties, elem_id="", routes=None):
     """Render one instance's table: only the fields the schema defines,
     plus any nested CPI table properties relevant to this element, plus
@@ -280,7 +325,19 @@ def render_schema_table(doc, schema, name, properties, elem_id="", routes=None):
     for section_name, fields in schema["sections"]:
         add_band_row(table, section_name)
         for label, field_spec in fields:
+            # resolve value normally, then apply ContentModifier body fallback
             val = resolve_field(context, field_spec)
+            # if this field is the Body field commonly named 'bodyContent',
+            # and it's empty, try a list of fallback property keys
+            is_body_field = False
+            if field_spec == "bodyContent":
+                is_body_field = True
+            elif isinstance(field_spec, (list, tuple)) and "bodyContent" in field_spec:
+                is_body_field = True
+
+            if is_body_field and not val:
+                val = find_body_in_context(context)
+
             add_label_value_row(table, label, val)
             # log missing expected fields for easier debugging
             if not val and field_spec not in ("__NAME__",):
@@ -296,6 +353,44 @@ def render_schema_table(doc, schema, name, properties, elem_id="", routes=None):
         add_label_value_row(table, label, "")
         container_cell = table.rows[-1].cells[1]
         add_multi_column_table(doc, rows, container_cell=container_cell)
+
+    # also try to render External Parameters (common property names)
+    for ep_key in EXTERNAL_PARAM_KEYS:
+        if ep_key in properties and properties[ep_key]:
+            val = properties[ep_key]
+            # if it's a nested CPI table string, parse and render inline
+            if looks_like_nested_table(val):
+                rows = parse_nested_table(val)
+                if rows:
+                    add_label_value_row(table, "External Parameters", "")
+                    container_cell = table.rows[-1].cells[1]
+                    add_multi_column_table(doc, rows, container_cell=container_cell)
+                    continue
+            # try JSON list/dict
+            try:
+                parsed = json.loads(val)
+                # if it's a list of objects, render column headers as keys
+                if isinstance(parsed, list) and parsed:
+                    rows = []
+                    if isinstance(parsed[0], dict):
+                        for item in parsed:
+                            row = OrderedDict()
+                            for k, v in item.items():
+                                row[str(k)] = str(v)
+                            rows.append(row)
+                        add_label_value_row(table, "External Parameters", "")
+                        container_cell = table.rows[-1].cells[1]
+                        add_multi_column_table(doc, rows, container_cell=container_cell)
+                        continue
+                elif isinstance(parsed, dict):
+                    rows = [ {k: str(v)} for k, v in parsed.items() ]
+                    add_label_value_row(table, "External Parameters", "")
+                    container_cell = table.rows[-1].cells[1]
+                    add_multi_column_table(doc, rows, container_cell=container_cell)
+                    continue
+            except Exception:
+                # not JSON - just render as text under External Parameters
+                add_label_value_row(table, "External Parameters", extract_text_from_xml(str(val)))
 
     if routes:
         # similarly add the Route Conditions table inline
