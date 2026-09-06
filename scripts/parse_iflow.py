@@ -20,6 +20,10 @@ import json
 import zipfile
 import tempfile
 import xml.etree.ElementTree as ET
+import logging
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+logger = logging.getLogger(__name__)
 
 FLOW_NODE_TAGS = {
     "serviceTask", "callActivity", "scriptTask", "sendTask", "receiveTask",
@@ -35,7 +39,11 @@ def local(tag):
 
 
 def get_properties(elem):
-    """Direct ifl:property key/value pairs on this element's extensionElements."""
+    """Direct ifl:property key/value pairs on this element's extensionElements.
+
+    Preserves inner XML content of <value> if present (so nested tables like
+    headerTable / propertyTable are retained).
+    """
     props = {}
     for child in elem:
         if local(child.tag) == "extensionElements":
@@ -47,7 +55,18 @@ def get_properties(elem):
                         if t == "key":
                             k = (pc.text or "").strip()
                         elif t == "value":
-                            v = (pc.text or "").strip() if pc.text else ""
+                            # preserve inner XML (child nodes) if present,
+                            # otherwise fall back to text content
+                            try:
+                                inner_parts = []
+                                for sub in pc:
+                                    # ET.tostring returns the element including its tags
+                                    inner_parts.append(ET.tostring(sub, encoding="unicode"))
+                                joined = "".join(inner_parts).strip()
+                                v = joined or (pc.text or "").strip()
+                            except Exception:
+                                # best-effort fallback to plain text
+                                v = (pc.text or "").strip()
                     if k:
                         props[k] = v
     return props
@@ -267,15 +286,19 @@ def parse(zip_path):
 
 def main():
     if len(sys.argv) != 3:
-        print("Usage: python parse_iflow.py <iflow.zip> <output.json>")
+        logger.error("Usage: python parse_iflow.py <iflow.zip> <output.json>")
         sys.exit(1)
     zip_path, out_path = sys.argv[1], sys.argv[2]
-    data = parse(zip_path)
-    with open(out_path, "w") as f:
-        json.dump(data, f, indent=2)
-    print(f"Parsed {len(data['pallet_elements'])} pallet elements, "
-          f"{len(data['adapters'])} adapters, "
-          f"{len(data['processes'])} processes -> {out_path}")
+    try:
+        data = parse(zip_path)
+        with open(out_path, "w") as f:
+            json.dump(data, f, indent=2)
+        logger.info(f"Parsed {len(data['pallet_elements'])} pallet elements, "
+                    f"{len(data['adapters'])} adapters, "
+                    f"{len(data['processes'])} processes -> {out_path}")
+    except Exception as e:
+        logger.exception("Failed to parse iflow package")
+        sys.exit(2)
 
 
 if __name__ == "__main__":

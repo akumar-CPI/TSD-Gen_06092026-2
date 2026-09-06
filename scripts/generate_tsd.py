@@ -6,28 +6,6 @@ Reads the JSON produced by parse_iflow.py and renders a Technical
 Specification Document (.docx) that follows the FICOPROC TSD template's
 table-based layout.
 
-Design rules (per production feedback):
-  - ONLY fields defined in schema_map.py are ever rendered. There is
-    no "dump every extra property" fallback - if a field isn't part of
-    the template, it doesn't show up, full stop. This keeps the
-    document limited to what's actually documented in the template and
-    keeps internal/plumbing CPI properties (component version numbers,
-    SWCV ids, cmdVariantUri, etc.) out of the doc entirely.
-  - Numbered headings: "3. Pallet Function Details" then "3.1 Content
-    Modifier", "3.2 Router", etc. - ONE heading per distinct pallet
-    function type (in order of first appearance), with every instance
-    of that type's table stacked directly underneath. No "Instance 1 /
-    Instance 2" sub-labels - the table's own "Name" row is what
-    distinguishes each occurrence.
-  - Nested "table inside a property" values (CPI's Content Modifier
-    Message Header / Exchange Property, etc.) are detected and rendered
-    as their own proper multi-column table (Action/Name/Type/Datatype/
-    Value/Default), not dumped as raw escaped XML text.
-  - A pallet function type with zero instances in the iFlow gets no
-    section at all. A type with no schema entry yet gets a heading and
-    a Name-only table (so it's not silently missing from the numbering),
-    never a raw property dump.
-
 Usage:
     python generate_tsd.py <parsed.json> <output.docx>
 """
@@ -36,6 +14,7 @@ import json
 import re
 import xml.etree.ElementTree as ET
 from collections import OrderedDict
+import logging
 
 from docx import Document
 from docx.shared import Pt, RGBColor, Cm
@@ -45,6 +24,9 @@ from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
 
 from schema_map import PALLET_SCHEMAS, ADAPTER_SCHEMAS
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+logger = logging.getLogger(__name__)
 
 FONT_NAME = "Ubuntu"
 HEADER_FILL = "1CADE4"
@@ -68,6 +50,9 @@ def set_run_font(run, size, bold=False, color=None):
     if rFonts is None:
         rFonts = OxmlElement('w:rFonts')
         rPr.append(rFonts)
+    # set fonts for ASCII, hAnsi and eastAsia so Word on all platforms picks it up
+    rFonts.set(qn('w:ascii'), FONT_NAME)
+    rFonts.set(qn('w:hAnsi'), FONT_NAME)
     rFonts.set(qn('w:eastAsia'), FONT_NAME)
     run.font.size = Pt(size)
     run.font.bold = bold
@@ -128,8 +113,12 @@ def new_table(doc):
     table = doc.add_table(rows=0, cols=2)
     table.alignment = WD_TABLE_ALIGNMENT.LEFT
     table.style = "Table Grid"
-    table.columns[0].width = Cm(5.5)
-    table.columns[1].width = Cm(10.5)
+    # try to set column widths (python-docx can be inconsistent here)
+    try:
+        table.columns[0].width = Cm(5.5)
+        table.columns[1].width = Cm(10.5)
+    except Exception:
+        pass
     # CRITICAL: Word (and python-docx) merges two <w:tbl> elements that
     # sit back-to-back with nothing between them into ONE visual table.
     # Every table this generator creates must be followed by a paragraph
@@ -417,13 +406,17 @@ def render(data, out_path):
             else:
                 render_unmapped_table(doc, ad["name"], elem_id=ad.get("id", ""))
 
-    doc.save(out_path)
-    print(f"Wrote {out_path}")
+    try:
+        doc.save(out_path)
+        logger.info(f"Wrote {out_path}")
+    except Exception:
+        logger.exception("Failed to write output docx")
+        raise
 
 
 def main():
     if len(sys.argv) != 3:
-        print("Usage: python generate_tsd.py <parsed.json> <output.docx>")
+        logger.error("Usage: python generate_tsd.py <parsed.json> <output.docx>")
         sys.exit(1)
     with open(sys.argv[1]) as f:
         data = json.load(f)
