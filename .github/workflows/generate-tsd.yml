@@ -1,0 +1,150 @@
+name: Generate iFlow Technical Specification Document
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "iflows/**.zip"
+  workflow_dispatch:
+    inputs:
+      iflow_path:
+        description: "Path to a specific iFlow zip to (re)generate (optional - generates all changed ones if empty)"
+        required: false
+
+# Prevent two runs from racing to commit generated docs back to the
+# same branch at once.
+concurrency:
+  group: generate-tsd-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  generate-tsd:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies (pinned)
+        run: pip install -r requirements.txt
+
+      - name: Determine changed iFlow zips
+        id: changed
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p docs/generated-tsd
+          if [ -n "${{ github.event.inputs.iflow_path }}" ]; then
+            echo "files=${{ github.event.inputs.iflow_path }}" >> "$GITHUB_OUTPUT"
+          else
+            FILES=$(git diff --name-only HEAD~1 HEAD -- 'iflows/*.zip' || true)
+            if [ -z "$FILES" ]; then
+              FILES=$(find iflows -name '*.zip' 2>/dev/null || true)
+            fi
+            if [ -z "$FILES" ]; then
+              echo "::notice::No iFlow zip files found to process."
+            fi
+            echo "files<<EOF" >> "$GITHUB_OUTPUT"
+            echo "$FILES" >> "$GITHUB_OUTPUT"
+            echo "EOF" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Generate and validate TSD for each changed iFlow
+        id: generate
+        shell: bash
+        run: |
+          set -euo pipefail
+          FAILED=0
+          GENERATED=()
+          while IFS= read -r ZIP; do
+            [ -z "$ZIP" ] && continue
+            echo "::group::Processing $ZIP"
+            BASENAME=$(basename "$ZIP" .zip)
+            JSON_OUT="/tmp/${BASENAME}.json"
+            DOCX_OUT="docs/generated-tsd/${BASENAME}_TSD.docx"
+
+            if ! python scripts/parse_iflow.py "$ZIP" "$JSON_OUT"; then
+              echo "::error file=$ZIP::Failed to parse iFlow package."
+              FAILED=1
+              echo "::endgroup::"
+              continue
+            fi
+
+            if ! python scripts/generate_tsd.py "$JSON_OUT" "$DOCX_OUT"; then
+              echo "::error file=$ZIP::Failed to generate the TSD document."
+              FAILED=1
+              echo "::endgroup::"
+              continue
+            fi
+
+            # Sanity checks - a docx is a zip archive; a near-empty file or
+            # one that isn't a valid zip means generation silently broke.
+            if [ ! -s "$DOCX_OUT" ]; then
+              echo "::error file=$DOCX_OUT::Generated file is missing or empty."
+              FAILED=1
+              echo "::endgroup::"
+              continue
+            fi
+            MIN_BYTES=5000
+            ACTUAL_BYTES=$(stat -c%s "$DOCX_OUT" 2>/dev/null || stat -f%z "$DOCX_OUT")
+            if [ "$ACTUAL_BYTES" -lt "$MIN_BYTES" ]; then
+              echo "::error file=$DOCX_OUT::Generated file is suspiciously small (${ACTUAL_BYTES} bytes) - likely near-empty output."
+              FAILED=1
+              echo "::endgroup::"
+              continue
+            fi
+            if ! python -c "import zipfile,sys; zipfile.ZipFile(sys.argv[1]).testzip()" "$DOCX_OUT"; then
+              echo "::error file=$DOCX_OUT::Generated file is not a valid docx/zip archive."
+              FAILED=1
+              echo "::endgroup::"
+              continue
+            fi
+
+            echo "OK: $DOCX_OUT ($ACTUAL_BYTES bytes)"
+            GENERATED+=("$DOCX_OUT")
+            echo "::endgroup::"
+          done <<< "${{ steps.changed.outputs.files }}"
+
+          if [ "$FAILED" -eq 1 ]; then
+            echo "One or more iFlows failed to generate cleanly - see errors above."
+            exit 1
+          fi
+          if [ "${#GENERATED[@]}" -eq 0 ]; then
+            echo "has_output=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_output=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Uploaded as a workflow artifact independent of the commit-back step
+      # below, so the document is retrievable even if branch protection or
+      # token permissions block the push (a common surprise on new repos).
+      - name: Upload generated documents as workflow artifact
+        if: steps.generate.outputs.has_output == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: generated-tsd-documents
+          path: docs/generated-tsd/*.docx
+          retention-days: 30
+
+      - name: Commit generated documents back to the repo
+        if: steps.generate.outputs.has_output == 'true'
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add docs/generated-tsd/*.docx
+          if git diff --cached --quiet; then
+            echo "No changes to commit (output identical to previous run)."
+          else
+            git commit -m "chore: auto-generate TSD document(s) [skip ci]"
+            git push
+          fi
