@@ -129,7 +129,11 @@ def new_table(doc):
     return table
 
 
-def add_multi_column_table(doc, rows, columns=None):
+def add_multi_column_table(doc, rows, columns=None, container_cell=None):
+    """Create a multi-column table. If container_cell is provided, the
+    table is added inside that cell (nested table). Otherwise it's added
+    at document level.
+    """
     if columns is None:
         columns = []
         for r in rows:
@@ -140,8 +144,19 @@ def add_multi_column_table(doc, rows, columns=None):
         ordered += [c for c in columns if c not in ordered]
         columns = ordered or ["Value"]
 
-    table = doc.add_table(rows=0, cols=len(columns))
-    table.style = "Table Grid"
+    if container_cell is not None:
+        table = container_cell.add_table(rows=0, cols=len(columns))
+    else:
+        table = doc.add_table(rows=0, cols=len(columns))
+        # when adding at document level, keep the usual style/spacer behavior
+        table.style = "Table Grid"
+
+    # apply style for both nested and top-level tables
+    try:
+        table.style = table.style or "Table Grid"
+    except Exception:
+        pass
+
     hdr = table.add_row()
     for i, col in enumerate(columns):
         run = hdr.cells[i].paragraphs[0].add_run(col)
@@ -151,7 +166,10 @@ def add_multi_column_table(doc, rows, columns=None):
         row = table.add_row()
         for i, col in enumerate(columns):
             set_multiline_text(row.cells[i].paragraphs[0], r.get(col, ""))
-    doc.add_paragraph().paragraph_format.space_after = Pt(6)  # see new_table() note
+
+    if container_cell is None:
+        # only add the document-level spacer when table is top-level
+        doc.add_paragraph().paragraph_format.space_after = Pt(6)  # see new_table() note
     return table
 
 
@@ -255,20 +273,35 @@ def render_schema_table(doc, schema, name, properties, elem_id="", routes=None):
     # multiple instances of the same type are still distinguishable.
     context["__name__"] = name or elem_id or "(unnamed)"
 
+    # debug: show available property keys when verbose
+    logger.debug(f"Rendering element {context['__name__']} ({elem_id}) properties: {list(properties.keys())}")
+
     table = new_table(doc)
     for section_name, fields in schema["sections"]:
         add_band_row(table, section_name)
         for label, field_spec in fields:
-            add_label_value_row(table, label, resolve_field(context, field_spec))
+            val = resolve_field(context, field_spec)
+            add_label_value_row(table, label, val)
+            # log missing expected fields for easier debugging
+            if not val and field_spec not in ("__NAME__",):
+                logger.debug(f"Field '{field_spec}' for label '{label}' is empty for element {context['__name__']} ({elem_id})")
 
-    for key, rows in extract_nested_tables(properties).items():
+    # Insert nested CPI tables inline in the value cell of a new row so they
+    # visually belong to the same element block (e.g. Content Modifier).
+    nested = extract_nested_tables(properties)
+    for key, rows in nested.items():
         label = NESTED_TABLE_LABELS.get(key, key)
-        add_heading(doc, label, level=3)
-        add_multi_column_table(doc, rows)
+        # add a label/value row and then put the nested multi-column table
+        # inside the value cell of that newly added row
+        add_label_value_row(table, label, "")
+        container_cell = table.rows[-1].cells[1]
+        add_multi_column_table(doc, rows, container_cell=container_cell)
 
     if routes:
-        add_heading(doc, "Route Conditions", level=3)
-        add_multi_column_table(doc, routes, columns=["Order", "Route Name", "Conditional Expression", "Default Route"])
+        # similarly add the Route Conditions table inline
+        add_label_value_row(table, "Route Conditions", "")
+        container_cell = table.rows[-1].cells[1]
+        add_multi_column_table(doc, routes, columns=["Order", "Route Name", "Conditional Expression", "Default Route"], container_cell=container_cell)
 
 
 def render_unmapped_table(doc, name, elem_id=""):
